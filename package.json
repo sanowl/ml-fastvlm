@@ -1,0 +1,43 @@
+{
+  "name": "ml-fastvlm",
+  "version": "1.0.0",
+  "description": "This is the official repository of **[FastVLM: Efficient Vision Encoding for Vision Language Models](https://www.arxiv.org/abs/2412.13303). (CVPR 2025)**",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "node web_automation.js",
+    "test:basic": "node web_automation.js basic",
+    "test:ecommerce": "node web_automation.js ecommerce",
+    "test:forms": "node web_automation.js forms",
+    "test:scraping": "node web_automation.js scraping",
+    "start": "node web_automation.js",
+    "ask": "node scripts/ask.js",
+    "talk": "node scripts/talk.js",
+    "smoke:adapter": "node scripts/smoke-test-adapter.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/apple/ml-fastvlm.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/apple/ml-fastvlm/issues"
+  },
+  "homepage": "https://github.com/apple/ml-fastvlm#readme",
+  "dependencies": {
+    "axios": "^1.12.2",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "http-proxy-middleware": "^3.0.5",
+    "magnitude": "^1.0.0",
+    "playwright": "^1.55.0"
+  },
+  "devDependencies": {
+    "magnitude-test": "^0.3.10"
+  }
+}
