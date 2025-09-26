@@ -1,3 +1,6 @@
+// FastVLM-to-Magnitude API Adapter
+// This creates a Claude-compatible API that Magnitude can use, but powered by FastVLM
+
 const express = require('express');
 const axios = require('axios');
 require('dotenv').config();
@@ -109,6 +112,7 @@ function extractTaskInstruction(prompt) {
 }
 
 function extractActiveUrlFromPrompt(prompt) {
+    // Looks for a line like: Open Tabs:\n[ACTIVE] Wikipedia ... (https://en.wikipedia.org/wiki/Main_Page)
     if (!prompt) return null;
     const m = String(prompt).match(/\[ACTIVE\][^\(]*\((https?:\/\/[^\)]+)\)/i);
     return m ? m[1] : null;
@@ -123,13 +127,112 @@ function chooseSearchNavUrl(task, basePrompt) {
     } else if (/google\./i.test(activeUrl)) {
         url = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
     } else {
+        // Default to Wikipedia search if unknown
         url = `https://en.wikipedia.org/w/index.php?search=${encodeURIComponent(query)}`;
     }
     return { url, query };
 }
 
+function getEnvList(name, fallback = []) {
+    const v = process.env[name];
+    if (!v || typeof v !== 'string') return fallback.slice();
+    return v.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+function parseCityFromTask(task) {
+    if (!task) return null;
+    const s = String(task);
+    // Common patterns: "in Paris", "to Paris", "for … in Paris"
+    const m = s.match(/\b(?:in|to)\s+([A-Za-z][A-Za-z\s\-]{1,40})\b/);
+    if (m && m[1]) {
+        return m[1].trim().replace(/[,.;].*$/, '').trim();
+    }
+    // Fallback: single capitalized word like Paris
+    const m2 = s.match(/\b([A-Z][a-z]{2,})\b/);
+    return m2 ? m2[1] : null;
+}
+
+function nextWeekendDates() {
+    const now = new Date();
+    const day = now.getDay(); // 0=Sun…6=Sat
+    let daysUntilSat = (6 - day + 7) % 7;
+    if (daysUntilSat === 0) daysUntilSat = 7; // always next Saturday
+    const checkin = new Date(now.getFullYear(), now.getMonth(), now.getDate() + daysUntilSat);
+    const checkout = new Date(checkin.getFullYear(), checkin.getMonth(), checkin.getDate() + 2); // Sat->Mon
+    const fmt = (d) => d.toISOString().slice(0, 10);
+    return { checkin: fmt(checkin), checkout: fmt(checkout) };
+}
+
+function shouldUseBookingDeepLink(task, basePrompt) {
+    if (process.env.FASTVLM_ENABLE_BOOKING_DEEPLINK !== '1') return false;
+    const src = `${task}\n${basePrompt || ''}`;
+    return /booking\.com|\bhotel\b/i.test(src);
+}
+
+function buildBookingDeepLinkPlan(task) {
+    const city = parseCityFromTask(task) || 'Paris';
+    const { checkin, checkout } = nextWeekendDates();
+    const template = process.env.BOOKING_DEEPLINK_TEMPLATE || 'https://www.booking.com/searchresults.html?ss={city}&checkin={checkin}&checkout={checkout}';
+    const url = template
+        .replace('{city}', encodeURIComponent(city))
+        .replace('{checkin}', encodeURIComponent(checkin))
+        .replace('{checkout}', encodeURIComponent(checkout));
+    return JSON.stringify({
+        reasoning: `Deep-link to Booking.com results for ${city} (next weekend), with filters where supported.`,
+        actions: [ { variant: 'browser:nav', url } ]
+    });
+}
+
+function buildClickFirstPlan(task, basePrompt) {
+    const t = task || 'the task';
+    const query = t.replace(/^[Ss]earch\s*for\s*/,'').replace(/^\"|\"$/g,'').trim() || t;
+    const cookieLabels = getEnvList('CLICK_COOKIE_LABELS', ['Accept cookies','Accept','Agree']);
+    const destLabels = getEnvList('CLICK_DESTINATION_LABELS', ['Destination','Where are you going?','Search']);
+    const actions = [];
+    if (cookieLabels.length) actions.push({ variant: 'mouse:click', target: cookieLabels[0] });
+    if (cookieLabels.length > 1) actions.push({ variant: 'mouse:click', target: cookieLabels[1] });
+    if (destLabels.length) actions.push({ variant: 'mouse:click', target: destLabels[0] });
+    if (destLabels.length > 1) actions.push({ variant: 'mouse:click', target: destLabels[1] });
+    actions.push({ variant: 'keyboard:type', content: query });
+    actions.push({ variant: 'keyboard:enter' });
+    return JSON.stringify({
+        reasoning: `Use on-page controls (clicks) rather than typing blindly. Complete ${t}.`,
+        actions
+    });
+}
+
+function buildDefaultClickPlan(task, basePrompt) {
+    const t = task || 'the task';
+    const query = t.replace(/^[Ss]earch\s*for\s*/,'').replace(/^\"|\"$/g,'').trim() || t;
+    return JSON.stringify({
+        reasoning: `Search for destination: ${query}`,
+        actions: [
+            { variant: 'mouse:click', target: 'Where are you going?' },
+            { variant: 'keyboard:type', content: query },
+            { variant: 'keyboard:enter' }
+        ]
+    });
+}
+
 function appendPlanningInstruction(prompt) {
-    const guide = `\n\nReturn ONLY JSON with this exact schema (no extra text): {"reasoning": string, "actions": [{"variant": string, ...fields}]}. Use these action variants when appropriate: "keyboard:select_all", "keyboard:backspace", "keyboard:type" (with field {"content": string}), "keyboard:enter", "browser:nav" (with field {"url": string}).`;
+    const guide = `\n\nYou are a web automation assistant. Analyze the screenshot and determine the appropriate actions to complete the given task.
+
+Return ONLY valid JSON in this exact format:
+{"reasoning": "brief explanation of what you see and your plan", "actions": [list of action objects]}
+
+Available actions:
+- {"variant": "mouse:click", "target": "exact text from buttons/links you see"}
+- {"variant": "keyboard:type", "content": "text to type"}
+- {"variant": "keyboard:enter"}
+
+Instructions:
+1. Look at what's currently visible on the page
+2. For search tasks, extract the search term from the task description
+3. For location-based tasks, extract the location name from the task
+4. Use the exact text you see on buttons and form fields
+5. Be contextually aware - adapt to what the page currently shows
+
+Important: When using keyboard:type, type the actual extracted information, not example text or instructions.`;
     if (!prompt) return guide.trim();
     return `${prompt.trim()}${guide}`;
 }
@@ -140,11 +243,67 @@ function extractReasoningFromText(text) {
     return m ? m[1].trim() : '';
 }
 
+function normalizeActions(actionsRaw) {
+    const allowed = new Set([
+        'mouse:click',
+        'keyboard:type',
+        'keyboard:enter',
+        'keyboard:select_all',
+        'keyboard:backspace',
+        'browser:nav',
+    ]);
+    const out = [];
+    const arr = Array.isArray(actionsRaw) ? actionsRaw : (actionsRaw ? [actionsRaw] : []);
+    for (const a of arr) {
+        if (!a || typeof a !== 'object') continue;
+        const variant = String(a.variant || '').trim();
+        if (!allowed.has(variant)) continue;
+        const item = { variant };
+        if (variant === 'mouse:click') {
+            const target = a.target || a.label || a.selector;
+            if (typeof target === 'string' && target.trim()) item.target = target.trim(); else continue;
+        } else if (variant === 'keyboard:type') {
+            if (typeof a.content === 'string') item.content = a.content;
+        } else if (variant === 'browser:nav') {
+            if (typeof a.url === 'string') item.url = a.url;
+        } // keyboard:enter/select_all/backspace carry no extra fields
+        out.push(item);
+    }
+    return out;
+}
+
+function coercePlanFromText(rawText, basePrompt) {
+    if (!rawText) return null;
+    const text = String(rawText).trim();
+    const tryParse = (s) => { try { return JSON.parse(s); } catch { return null; } };
+
+    // Try full parse, then fragment parse
+    let parsed = tryParse(text);
+    if (!parsed) {
+        const first = text.indexOf('{');
+        const last = text.lastIndexOf('}');
+        if (first !== -1 && last !== -1 && last > first) parsed = tryParse(text.slice(first, last + 1));
+    }
+    if (!parsed || typeof parsed !== 'object') return null;
+
+    // Accept both action and actions keys
+    let actions = parsed.actions != null ? parsed.actions : parsed.action;
+    const norm = normalizeActions(actions);
+    if (!norm.length) return null;
+
+    const reasoning = typeof parsed.reasoning === 'string' && parsed.reasoning.trim()
+        ? parsed.reasoning.trim()
+        : (extractReasoningFromText(text) || 'Plan derived from model response');
+
+    return JSON.stringify({ reasoning, actions: norm });
+}
+
 function extractStepsFromText(text) {
     if (!text) return [];
     const s = String(text);
     const tagMatches = [...s.matchAll(/<step>\s*([\s\S]*?)\s*<\/step>/gi)].map(m => m[1].trim()).filter(Boolean);
     if (tagMatches.length) return tagMatches;
+    // Fallback: split lines, ignore reasoning line
     return s.split(/\r?\n/)
         .map(l => l.trim())
         .filter(l => l.length > 0 && !/^Reasoning:/i.test(l));
@@ -182,10 +341,12 @@ function ensureJsonResponse(rawResponse, contextPrompt = '') {
     };
 
     const normalizeShape = (obj) => {
-        const out = { ...obj }; 
+        const out = { ...obj };
+        // If the model replied with { data: { reasoning, passed } }, also mirror reasoning to top-level
         if (out && out.data && typeof out.data.reasoning === 'string') {
             if (typeof out.reasoning !== 'string') out.reasoning = out.data.reasoning;
-
+        }
+        // If the model replied with { reasoning, passed }, also embed into data
         if (typeof out.reasoning === 'string' && (!out.data || typeof out.data !== 'object')) {
             out.data = {
                 reasoning: out.reasoning,
@@ -206,6 +367,7 @@ function ensureJsonResponse(rawResponse, contextPrompt = '') {
                 return true;
             }
         } catch (err) {
+            // ignore
         }
         return false;
     };
@@ -227,6 +389,7 @@ function ensureJsonResponse(rawResponse, contextPrompt = '') {
         }
 
         const normalized = trimmed.replace(/\s+/g, ' ');
+        // Heuristics: look at context prompt (contains Open Tabs and check) and model text
         const ctx = (contextPrompt || '').toLowerCase();
         let positive = false;
         let heuristic = null;
@@ -271,14 +434,17 @@ class FastVLMMagnitudeAdapter {
     constructor(fastvlmUrl = 'http://localhost:8000') {
         this.fastvlmUrl = fastvlmUrl;
         this.app = express();
+        // Parse JSON including vendor-specific content types
         this.app.use(express.json({ limit: '50mb', type: ['application/json', 'application/*+json'] }));
         this.app.use(express.urlencoded({ extended: true }));
+        // Simple request logger
         this.app.use((req, _res, next) => {
             try {
                 console.log(`➡️  ${req.method} ${req.url}`);
             } catch {}
             next();
         });
+        // CORS headers (apply before routes so every endpoint gets headers)
         this.app.use((req, res, next) => {
             res.header('Access-Control-Allow-Origin', '*');
             res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -292,6 +458,7 @@ class FastVLMMagnitudeAdapter {
     }
 
     setupRoutes() {
+        // Health check endpoint
         this.app.get('/health', async (req, res) => {
             try {
                 const response = await axios.get(`${this.fastvlmUrl}/health`);
@@ -394,23 +561,37 @@ class FastVLMMagnitudeAdapter {
 
                     let responseContent;
                     if (planning) {
-                        // Prefer JSON from model; fallback to build JSON from text
+                        // Prefer JSON from model; fallback to intelligent coercion
                         const raw = typeof rawResponse === 'string' ? rawResponse.trim() : '';
+                        console.log('🧪 Raw FastVLM planning response:', raw);
+
                         let plan;
                         try {
                             plan = JSON.parse(raw);
-                        } catch {}
+                            console.log('✅ Successfully parsed FastVLM plan:', plan);
+                        } catch (parseError) {
+                            console.log('⚠️ JSON parse failed, trying coercion:', parseError.message);
+                            // Try to coerce a plan from the text response
+                            const coercedPlan = coercePlanFromText(raw, basePrompt);
+                            if (coercedPlan) {
+                                plan = JSON.parse(coercedPlan);
+                                console.log('✅ Coerced plan from text:', plan);
+                            }
+                        }
+
                         if (!plan || typeof plan !== 'object' || typeof plan.reasoning !== 'string' || !Array.isArray(plan.actions)) {
+                            console.log('❌ FastVLM did not provide valid plan, using minimal fallback');
                             const task = extractTaskInstruction(basePrompt) || 'the task';
-                            const reasoning = extractReasoningFromText(raw) || `Use the site's search to complete ${task}.`;
                             const query = task.replace(/^[Ss]earch\s*for\s*/,'').replace(/^"|"$/g,'').trim();
-                            const planActions = [
-                                { variant: 'keyboard:select_all' },
-                                { variant: 'keyboard:backspace' },
-                                { variant: 'keyboard:type', content: query },
-                                { variant: 'keyboard:enter' }
-                            ];
-                            plan = { reasoning, actions: planActions };
+                            // Use minimal fallback - let the vision model handle the next iteration
+                            plan = {
+                                reasoning: `FastVLM response was not parseable. Attempting to type search query: ${query}`,
+                                actions: [
+                                    { variant: 'keyboard:type', content: query },
+                                    { variant: 'keyboard:enter' }
+                                ]
+                            };
+                            console.log('⚠️ Using minimal fallback plan:', plan);
                         }
                         responseContent = JSON.stringify(plan);
                     } else {
@@ -528,6 +709,7 @@ class FastVLMMagnitudeAdapter {
         this.app.post('/v1/chat/completions', chatCompletions);
         this.app.post('/chat/completions', chatCompletions);
 
+        // Claude-compatible messages endpoint for Magnitude (keeping for compatibility)
         this.app.post('/v1/messages', async (req, res) => {
             try {
                 console.log('🔗 Magnitude -> FastVLM request received');
@@ -545,8 +727,8 @@ class FastVLMMagnitudeAdapter {
                 const prompt = planning ? appendPlanningInstruction(basePrompt) : appendJsonInstruction(basePrompt);
                 const imageBase64 = findLatestImage(messages);
 
-                console.log('Derived prompt (first 200 chars):', String(basePrompt).slice(0, 200));
-                console.log('Image present:', Boolean(imageBase64), imageBase64 ? `len=${imageBase64.length}` : '');
+                console.log('🧵 Derived prompt (first 200 chars):', String(basePrompt).slice(0, 200));
+                console.log('🖼️ Image present:', Boolean(imageBase64), imageBase64 ? `len=${imageBase64.length}` : '');
 
                 if (!prompt?.trim()) {
                     throw new Error('Unable to extract textual content from conversation');
@@ -559,17 +741,16 @@ class FastVLMMagnitudeAdapter {
                     let content;
                     if (planning) {
                         const task = extractTaskInstruction(basePrompt) || 'the task';
-                        const query = task.replace(/^[Ss]earch\s*for\s*/,'').replace(/^"|"$/g,'').trim();
-                        const plan = {
-                            reasoning: `Use the site's search to complete ${task}.`,
-                            actions: [
-                                { variant: 'keyboard:select_all' },
-                                { variant: 'keyboard:backspace' },
-                                { variant: 'keyboard:type', content: query },
-                                { variant: 'keyboard:enter' }
-                            ]
-                        };
-                        content = JSON.stringify(plan);
+                        const disableNav = !!process.env.FASTVLM_DISABLE_NAV_OVERRIDE;
+                        if (!disableNav) {
+                            const { url } = chooseSearchNavUrl(task, basePrompt);
+                            content = JSON.stringify({
+                                reasoning: `Navigate directly to results for ${task}.`,
+                                actions: [ { variant: 'browser:nav', url } ]
+                            });
+                        } else {
+                            content = buildDefaultClickPlan(task, basePrompt);
+                        }
                     } else {
                         const fb = ensureJsonResponse(`No screenshot received. Prompt: ${prompt.trim()}`);
                         content = fb.stringified;
@@ -593,8 +774,10 @@ class FastVLMMagnitudeAdapter {
                     return res.json(textOnlyResponse);
                 }
 
-                console.log('Prompt:', prompt.substring(0, 100) + '...');
-                console.log('Image received, length:', imageBase64.length);
+                console.log('📝 Prompt:', prompt.substring(0, 100) + '...');
+                console.log('🖼️ Image received, length:', imageBase64.length);
+
+                // Send to FastVLM
                 const fastvlmResponse = await axios.post(`${this.fastvlmUrl}/query`, {
                     prompt: prompt.trim(),
                     image_base64: imageBase64,
@@ -614,27 +797,29 @@ class FastVLMMagnitudeAdapter {
                 }
 
                 const rawResponse = fastvlmResponse.data?.response ?? fastvlmResponse.data;
-                console.log('FastVLM raw response:', rawResponse);
+                console.log('🧪 FastVLM raw response:', rawResponse);
                 let contentText;
                 if (planning) {
                     const disableNav = !!process.env.FASTVLM_DISABLE_NAV_OVERRIDE;
-                    if (!disableNav) {
+                    const raw = typeof rawResponse === 'string' ? rawResponse.trim() : '';
+                    const coerced = coercePlanFromText(raw, basePrompt);
+                    if (coerced) {
+                        contentText = coerced;
+                    } else if (!disableNav) {
                         const task = extractTaskInstruction(basePrompt) || 'the task';
                         const { url } = chooseSearchNavUrl(task, basePrompt);
-                        const plan = {
+                        contentText = JSON.stringify({
                             reasoning: `Navigate directly to results for ${task}.`,
                             actions: [ { variant: 'browser:nav', url } ]
-                        };
-                        contentText = JSON.stringify(plan);
+                        });
                     } else {
-                        const raw = typeof rawResponse === 'string' ? rawResponse.trim() : '';
-                        let plan;
-                        try { plan = JSON.parse(raw); } catch {}
-                        if (!plan || typeof plan !== 'object') {
-                            const task = extractTaskInstruction(basePrompt) || 'the task';
-                            plan = { reasoning: `Proceed to complete ${task}.`, actions: [] };
+                        const task = extractTaskInstruction(basePrompt) || 'the task';
+                        // If the task looks like a Booking flow, prefer deep-link over clicks to avoid grounding issues
+                        if (/booking\.com|\bhotel\b/i.test(basePrompt) || /\bhotel\b/i.test(task)) {
+                            contentText = buildBookingDeepLinkPlan(task);
+                        } else {
+                            contentText = buildDefaultClickPlan(task, basePrompt);
                         }
-                        contentText = JSON.stringify(plan);
                     }
                 } else {
                     const formatted = ensureJsonResponse(rawResponse, basePrompt);
@@ -642,7 +827,8 @@ class FastVLMMagnitudeAdapter {
                     contentText = formatted.stringified;
                 }
 
-                console.log('Adapter sending content to Magnitude (Claude path):', contentText);
+                console.log('🧭 Adapter sending content to Magnitude (Claude path):', contentText);
+                // Format response in Claude's format
                 const claudeResponse = {
                     id: `msg-fastvlm-${Date.now()}`,
                     type: "message",
@@ -666,7 +852,7 @@ class FastVLMMagnitudeAdapter {
                 res.json(claudeResponse);
 
             } catch (error) {
-                console.error(' Adapter error:', error.message);
+                console.error('❌ Adapter error:', error.message);
                 res.status(500).json({
                     type: "error",
                     error: {
@@ -731,16 +917,18 @@ class FastVLMMagnitudeAdapter {
         // Check if FastVLM is available
         try {
             await axios.get(`${this.fastvlmUrl}/health`);
-            console.log(' FastVLM backend is available');
+            console.log('✅ FastVLM backend is available');
         } catch (error) {
-            console.log(' Warning: FastVLM backend not available. Make sure to run: python web_agent.py');
+            console.log('⚠️ Warning: FastVLM backend not available. Make sure to run: python web_agent.py');
         }
 
         this.server = this.app.listen(port, () => {
-            console.log('FastVLM-Magnitude Adapter running on port', port);
-            console.log(' Adapter URL: http://localhost:' + port);
-            console.log(' FastVLM Backend: ' + this.fastvlmUrl);
+            console.log('🚀 FastVLM-Magnitude Adapter running on port', port);
+            console.log('🔗 Magnitude will connect to this adapter instead of Claude');
+            console.log('📡 Adapter URL: http://localhost:' + port);
+            console.log('🤖 FastVLM Backend: ' + this.fastvlmUrl);
             console.log('');
+            console.log('Configure Magnitude to use:');
             console.log('  ANTHROPIC_API_KEY=dummy-key-not-used');
             console.log('  ANTHROPIC_BASE_URL=http://localhost:' + port);
         });
@@ -751,17 +939,19 @@ class FastVLMMagnitudeAdapter {
     async stop() {
         if (this.server) {
             this.server.close();
-            console.log(' FastVLM-Magnitude Adapter stopped');
+            console.log('🔚 FastVLM-Magnitude Adapter stopped');
         }
     }
 }
 
+// Auto-start if run directly
 if (require.main === module) {
     const adapter = new FastVLMMagnitudeAdapter();
     adapter.start();
 
+    // Graceful shutdown
     process.on('SIGINT', async () => {
-        console.log('\n Shutting down adapter...');
+        console.log('\n🛑 Shutting down adapter...');
         await adapter.stop();
         process.exit(0);
     });
