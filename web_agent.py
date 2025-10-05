@@ -52,9 +52,9 @@ class TextLLMAgent:
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_path,
             torch_dtype=torch.float16,
-            device_map=self.device,
             trust_remote_code=True
         )
+        self.model = self.model.to(self.device)
         print(f"Text LLM loaded successfully on {self.device}")
 
     def predict(self, prompt: str, temperature: float = 0.2, max_tokens: int = 512) -> str:
@@ -117,15 +117,16 @@ class FastVLMAgent:
         ).unsqueeze(0).to(torch.device(self.device))
 
         image_tensor = process_images([image], self.image_processor, self.model.config)[0]
-        
+        image_tensor = image_tensor.to(self.device, dtype=torch.float16)
+
         with torch.inference_mode():
             output_ids = self.model.generate(
                 input_ids,
-                images=image_tensor.unsqueeze(0).half(),
+                images=image_tensor.unsqueeze(0),
                 image_sizes=[image.size],
                 do_sample=True if temperature > 0 else False,
                 temperature=temperature,
-                top_p=None,
+                top_p=0.9 if temperature > 0 else 1.0,
                 num_beams=1,
                 max_new_tokens=max_tokens,
                 use_cache=True
@@ -142,7 +143,6 @@ text_llm = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     global agent, text_llm
     model_path = os.getenv("FASTVLM_MODEL_PATH", "checkpoints/llava-fastvithd_0.5b_stage3")
     device = os.getenv("FASTVLM_DEVICE", "mps")
@@ -151,8 +151,9 @@ async def lifespan(app: FastAPI):
     else:
         agent = FastVLMAgent(model_path, device=device)
 
-    text_model_path = os.getenv("TEXT_LLM_PATH", "checkpoints/Qwen2.5-7B-Instruct")
+    text_model_path = os.getenv("TEXT_LLM_PATH", "checkpoints/Qwen2.5-1.5B-Instruct")
     if os.path.exists(os.path.expanduser(text_model_path)):
+        print("Loading Text LLM at startup (may take 1-2 minutes)...")
         text_llm = TextLLMAgent(text_model_path, device=device)
     else:
         print(f"Warning: Text LLM path {text_model_path} not found. Hybrid mode disabled.")
