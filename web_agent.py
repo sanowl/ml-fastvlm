@@ -31,6 +31,54 @@ class QueryResponse(BaseModel):
     processing_time: float
 
 
+class TextRequest(BaseModel):
+    prompt: str
+    temperature: float = 0.2
+    max_tokens: int = 512
+
+
+class TextLLMAgent:
+    def __init__(self, model_path: str, device: str = "mps"):
+        self.model_path = os.path.expanduser(model_path)
+        self.device = device
+        self.model = None
+        self.tokenizer = None
+        self.load_model()
+
+    def load_model(self):
+        """Load text-only LLM"""
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_path,
+            torch_dtype=torch.float16,
+            device_map=self.device,
+            trust_remote_code=True
+        )
+        print(f"Text LLM loaded successfully on {self.device}")
+
+    def predict(self, prompt: str, temperature: float = 0.2, max_tokens: int = 512) -> str:
+        start_time = time.time()
+
+        messages = [{"role": "user", "content": prompt}]
+        text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+        inputs = self.tokenizer([text], return_tensors="pt").to(self.device)
+
+        with torch.inference_mode():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=temperature if temperature > 0 else 0.01,
+                do_sample=temperature > 0,
+                top_p=0.9 if temperature > 0 else None
+            )
+
+        response = self.tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True).strip()
+        processing_time = time.time() - start_time
+        return response, processing_time
+
+
 class FastVLMAgent:
     def __init__(self, model_path: str, device: str = "mps"):
         self.model_path = os.path.expanduser(model_path)
@@ -42,7 +90,6 @@ class FastVLMAgent:
         self.load_model()
     
     def load_model(self):
-        """Load the FastVLM model"""
         disable_torch_init()
         model_name = get_model_name_from_path(self.model_path)
         self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model(
@@ -53,17 +100,13 @@ class FastVLMAgent:
         print(f"Model loaded successfully on {self.device}")
     
     def predict(self, prompt: str, image: Image.Image, temperature: float = 0.2, max_tokens: int = 256) -> str:
-        """Run inference on image and prompt"""
         start_time = time.time()
-        
-        # Construct prompt with image tokens
         qs = prompt
         if self.model.config.mm_use_im_start_end:
             qs = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + qs
         else:
             qs = DEFAULT_IMAGE_TOKEN + '\n' + qs
-        
-        # Use conversation template
+    
         conv = conv_templates["qwen_2"].copy()
         conv.append_message(conv.roles[0], qs)
         conv.append_message(conv.roles[1], None)
@@ -94,20 +137,26 @@ class FastVLMAgent:
         
         processing_time = time.time() - start_time
         return response, processing_time
-
-
-# Global model instance
 agent = None
+text_llm = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    global agent
-    model_path = "checkpoints/llava-fastvithd_0.5b_stage3"
-    if not os.path.exists(model_path):
-        print(f"Warning: Model path {model_path} not found. Please update the path.")
+    global agent, text_llm
+    model_path = os.getenv("FASTVLM_MODEL_PATH", "checkpoints/llava-fastvithd_0.5b_stage3")
+    device = os.getenv("FASTVLM_DEVICE", "mps")
+    if not os.path.exists(os.path.expanduser(model_path)):
+        print(f"Warning: Model path {model_path} not found. Please set FASTVLM_MODEL_PATH.")
     else:
-        agent = FastVLMAgent(model_path)
+        agent = FastVLMAgent(model_path, device=device)
+
+    text_model_path = os.getenv("TEXT_LLM_PATH", "checkpoints/Qwen2.5-7B-Instruct")
+    if os.path.exists(os.path.expanduser(text_model_path)):
+        text_llm = TextLLMAgent(text_model_path, device=device)
+    else:
+        print(f"Warning: Text LLM path {text_model_path} not found. Hybrid mode disabled.")
+
     yield
 app = FastAPI(
     title="FastVLM Web Agent",
@@ -118,7 +167,6 @@ app = FastAPI(
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -168,22 +216,38 @@ async def query_model(request: QueryRequest):
 
 @app.post("/query_url")
 async def query_from_url(prompt: str, image_url: str, temperature: float = 0.2, max_tokens: int = 256):
-    """Alternative endpoint that accepts image URL instead of base64"""
     if agent is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
-    
+
     try:
         import requests
         response = requests.get(image_url)
         image = Image.open(io.BytesIO(response.content)).convert('RGB')
-        
+
         result, processing_time = agent.predict(prompt, image, temperature, max_tokens)
-        
+
         return QueryResponse(response=result, processing_time=processing_time)
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing image URL: {str(e)}")
 
+
+@app.post("/query_text", response_model=QueryResponse)
+async def query_text_model(request: TextRequest):
+    if text_llm is None:
+        raise HTTPException(status_code=503, detail="Text LLM not loaded")
+
+    try:
+        response, processing_time = text_llm.predict(
+            request.prompt,
+            request.temperature,
+            request.max_tokens
+        )
+
+        return QueryResponse(response=response, processing_time=processing_time)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Text inference error: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
