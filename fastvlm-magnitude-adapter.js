@@ -111,49 +111,48 @@ function chooseSearchNavUrl(task, basePrompt) {
     return { url, query };
 }
 
-function buildVisionPrompt(prompt) {
-    return `${prompt}
+function buildVisionPrompt() {
+    return `Describe what you see in this screenshot. Focus on interactive elements.
 
-Describe what you see in this screenshot. Focus on interactive elements:
-
-List all:
-- Buttons with their exact text labels
-- Input fields with their labels or placeholder text
-- Links with their exact text
+List all visible:
+- Buttons (include exact text labels)
+- Input fields (include labels or placeholder text)
+- Links (include exact text)
 - Icons and their locations
 - Navigation menus
 
-Be precise and factual. Just describe what is visible.`;
+Be precise and factual. Only describe what is visible, no JSON.`;
 }
 
 function buildActionPrompt(visionDescription, task) {
-    return `You are a web automation assistant. Given a vision description and a task, generate structured JSON actions.
+    return `You are a web automation assistant. Generate actions to complete the TASK using elements from the vision description.
+
+TASK: ${task}
 
 VISION DESCRIPTION:
 ${visionDescription}
 
-TASK:
-${task}
+CRITICAL: Focus ONLY on the TASK. Ignore other products/sections visible on the page.
 
-Generate a JSON action plan with this exact format:
+If TASK is "search for X":
+- Look for a search box in the vision description
+- Click search box, type X, press enter
+- OR navigate directly to search results for X
+
+Generate JSON in this EXACT format:
 {
   "reasoning": "brief explanation",
   "actions": [array of action objects]
 }
 
-Action types:
-- {"variant": "mouse:click", "target": "visual description from vision"}
-- {"variant": "keyboard:type", "content": "text extracted from task"}
+Valid action types:
+- {"variant": "mouse:click", "target": "element from vision"}
+- {"variant": "keyboard:type", "content": "text from task"}
 - {"variant": "keyboard:enter"}
-- {"variant": "browser:nav", "url": "full URL"}
 
-Rules:
-1. For mouse:click use visual descriptions from the VISION DESCRIPTION
-2. For keyboard:type extract content from the TASK (e.g. if task is "search for shoes", extract "shoes")
-3. Only use elements mentioned in the VISION DESCRIPTION
-4. Output ONLY valid JSON, no additional text
+Extract search terms from TASK (e.g., "search for shoes" → type "shoes", NOT "jeans" or other visible items).
 
-Generate the JSON now:`;
+Output ONLY valid JSON:`;
 }
 
 function extractReasoningFromText(text) {
@@ -403,7 +402,7 @@ class FastVLMMagnitudeAdapter {
                 const task = extractTaskInstruction(basePrompt);
                 const imageBase64 = findLatestImage(messages);
 
-                const prompt = planning ? buildVisionPrompt(basePrompt) : appendJsonInstruction(basePrompt);
+                const prompt = planning ? buildVisionPrompt() : appendJsonInstruction(basePrompt);
 
                 if (!prompt?.trim()) {
                     throw new Error('Unable to extract textual content from conversation');
@@ -448,10 +447,12 @@ class FastVLMMagnitudeAdapter {
                 try {
                     const fastvlmResponse = await axios.post(`${this.fastvlmUrl}/query`, {
                         prompt: prompt.trim(),
-                        image_base64: imageBase64
+                        image_base64: imageBase64,
+                        temperature: 0.2,
+                        max_tokens: planning ? 200 : 256
                     }, {
                         headers: { 'Content-Type': 'application/json' },
-                        timeout: 120000,
+                        timeout: 300000,
                         maxBodyLength: Infinity,
                         maxContentLength: Infinity
                     });
@@ -461,7 +462,10 @@ class FastVLMMagnitudeAdapter {
 
                     let responseContent;
                     if (planning) {
-                        let visionDescription = typeof rawResponse === 'string' ? rawResponse.trim() : '';
+                        const visionDescription = typeof rawResponse === 'string'
+                            ? rawResponse.trim()
+                            : String(rawResponse);
+
                         console.log('=== STAGE 1: FastVLM Vision Description ===');
                         console.log(visionDescription);
                         console.log('===========================================');
@@ -476,7 +480,7 @@ class FastVLMMagnitudeAdapter {
                                 max_tokens: 512
                             }, {
                                 headers: { 'Content-Type': 'application/json' },
-                                timeout: 60000
+                                timeout: 600000
                             });
 
                             const actionJSON = textLLMResponse.data?.response ?? textLLMResponse.data;
